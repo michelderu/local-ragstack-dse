@@ -7,11 +7,12 @@ import uuid
 
 import streamlit as st
 
-from langchain_community.vectorstores import AstraDB
-from langchain_openai import OpenAIEmbeddings
-from langchain_openai import ChatOpenAI
+from cassandra.cluster import Cluster
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.chat_models.ollama import ChatOllama
+from langchain_community.vectorstores import Cassandra
 from langchain.memory import ConversationBufferWindowMemory
-from langchain.memory import AstraDBChatMessageHistory
+from langchain_community.chat_message_histories import CassandraChatMessageHistory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, CSVLoader, WebBaseLoader
 from langchain.schema import HumanMessage, AIMessage
@@ -215,16 +216,12 @@ Answer in {language}:"""
 
     return ChatPromptTemplate.from_messages([("system", template)])
 
-# Get the OpenAI Chat Model
+# Cache OpenAI Chat Model for future runs
+@st.cache_resource()
 def load_model():
-    print(f"""load_model""")
-    # Get the OpenAI Chat Model
-    return ChatOpenAI(
-        temperature=0.3,
-        model='gpt-4-1106-preview',
-        streaming=True,
-        verbose=True
-    )
+    # parameters for ollama see: https://api.python.langchain.com/en/latest/chat_models/langchain_community.chat_models.ollama.ChatOllama.html
+    # num_ctx is the context window size
+    return ChatOllama(model="mistral:latest", num_ctx=18192, base_url=st.secrets['OLLAMA_ENDPOINT'])
 
 # Get the Retriever
 def load_retriever(top_k_vectorstore):
@@ -340,33 +337,41 @@ lang_dict = load_localization(language)
 ### Resources Cache ###
 #######################
 
-# Cache OpenAI Embedding for future runs
+# Cache HuggingFace Embedding for future runs
 @st.cache_resource(show_spinner=lang_dict['load_embedding'])
 def load_embedding():
     print("load_embedding")
-    # Get the OpenAI Embedding
-    return OpenAIEmbeddings()
+    # Get the HuggingFace Embedding
+    return HuggingFaceEmbeddings()
 
-# Cache Vector Store for future runs
-@st.cache_resource(show_spinner=lang_dict['load_vectorstore'])
+# Cache the DataStax Enterprise Vector Store for future runs
+@st.cache_resource(show_spinner='Connecting to Datastax Enterprise v7 with Vector Support')
+def load_session():
+    # Connect to DSE
+    cluster = Cluster([st.secrets['DSE_ENDPOINT']])
+    session = cluster.connect()
+    return session
+
+# Cache the DataStax Enterprise Vector Store for future runs
+@st.cache_resource(show_spinner='Connecting to Datastax Enterprise v7 with Vector Support')
 def load_vectorstore(username):
-    print(f"load_vectorstore for {username}")
-    # Get the load_vectorstore store from Astra DB
-    return AstraDB(
+    # Connect to the Vector Store
+    vector_store = Cassandra(
+        session=session,
         embedding=embedding,
-        collection_name=f"vector_context_{username}",
-        token=st.secrets["ASTRA_TOKEN"],
-        api_endpoint=os.environ["ASTRA_ENDPOINT"],
+        keyspace=st.secrets['DSE_KEYSPACE'],
+        table_name=f"vector_context_{username}"
     )
+    return vector_store
 
 # Cache Chat History for future runs
 @st.cache_resource(show_spinner=lang_dict['load_message_history'])
 def load_chat_history(username):
     print(f"load_chat_history for {username}_{st.session_state.session_id}")
-    return AstraDBChatMessageHistory(
-        session_id=f"{username}_{st.session_state.session_id}",
-        api_endpoint=os.environ["ASTRA_ENDPOINT"],
-        token=st.secrets["ASTRA_TOKEN"],
+    return CassandraChatMessageHistory(
+        session=session,
+        keyspace=st.secrets['DSE_KEYSPACE'],
+        session_id=f"{username}_{st.session_state.session_id}"
     )
 
 #####################
@@ -414,6 +419,7 @@ with st.sidebar:
 with st.sidebar:
     rails_dict = load_rails(username)
     embedding = load_embedding()
+    session = load_session()
     vectorstore = load_vectorstore(username)
     chat_history = load_chat_history(username)
 
